@@ -1,0 +1,170 @@
+# reusable/ecr-login.yml
+#
+# Reusable workflow: build one Spring Petclinic service, scan it with Trivy,
+# and push the ARM64 image to ECR dev.
+#
+# Called by build-push.yml once per changed service (matrix strategy).
+# All AWS credentials come through the caller via "secrets: inherit".
+#
+# Inputs:
+#   service        — ECR/Helm service name (e.g. "customers-service")
+#   sha            — 7-character commit SHA used as the image tag
+#   aws-region     — AWS region where ECR lives (default: eu-central-1)
+#   aws-account-id — AWS account ID used to construct the ECR registry URL
+#
+# Required secrets (passed via "secrets: inherit" from caller):
+#   AWS_ROLE_ARN — OIDC IAM role ARN (petclinic-github-actions-role)
+
+name: Build, Scan, Push (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name matching ECR repo and helm-values filename (e.g. customers-service)"
+        required: true
+        type: string
+      sha:
+        description: "7-character commit SHA used as the Docker image tag"
+        required: true
+        type: string
+      aws-region:
+        description: "AWS region where ECR repositories are hosted"
+        required: false
+        type: string
+        default: "eu-central-1"
+      aws-account-id:
+        description: "AWS account ID for constructing the ECR registry URL"
+        required: true
+        type: string
+
+permissions:
+  id-token: write  # Required for OIDC token exchange with AWS STS
+  contents: read
+
+jobs:
+  build-and-push:
+    name: ${{ inputs.service }}
+    runs-on: ubuntu-latest
+
+    env:
+      # Maven module: "spring-petclinic-customers-service" from "customers-service"
+      MAVEN_MODULE: spring-petclinic-${{ inputs.service }}
+      # Maven/Docker image produced locally by the buildDocker profile
+      SOURCE_IMAGE: springcommunity/spring-petclinic-${{ inputs.service }}
+      # ECR target image (dev environment)
+      TARGET_IMAGE: ${{ inputs.aws-account-id }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com/petclinic-dev/${{ inputs.service }}:${{ inputs.sha }}
+
+    steps:
+      # TODO(security): pin each action to a full commit SHA to prevent supply-chain
+      # attacks. Replace "@vN" with "@<sha>  # vN.N.N" once SHAs are verified.
+      # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions
+      - name: Checkout application repo
+        uses: actions/checkout@v4
+
+      # ── Java ───────────────────────────────────────────────────────────────
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: maven
+
+      # ── Docker (ARM64 cross-compilation) ───────────────────────────────────
+      # QEMU must be installed before Docker Buildx so the arm64 emulator is
+      # available. The Maven buildDocker profile calls "docker build --platform
+      # linux/arm64 --load", which routes through Buildx when it is the default
+      # builder. --load ensures the image lands in the local daemon for scanning.
+      - name: Set up QEMU (ARM64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx (default builder)
+        uses: docker/setup-buildx-action@v3
+
+      # ── AWS authentication (OIDC — no long-lived credentials) ──────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          region: ${{ inputs.aws-region }}
+
+      # ── Build ──────────────────────────────────────────────────────────────
+      # Builds the single service module and its upstream parents (-am).
+      # The buildDocker Maven profile calls:
+      #   docker build --build-arg ARTIFACT_NAME=... --build-arg EXPOSED_PORT=...
+      #                --platform linux/arm64 --load -t springcommunity/spring-petclinic-{service}
+      # The --load flag (container.build.extraarg in pom.xml) puts the image in
+      # the local daemon, where Trivy can scan it before the push.
+      - name: Build Docker image (ARM64) with Maven
+        run: |
+          ./mvnw clean install \
+            -P buildDocker \
+            -Dcontainer.platform="linux/arm64" \
+            -pl "${{ env.MAVEN_MODULE }}" -am \
+            --no-transfer-progress \
+            --batch-mode
+
+      # ── Trivy scanning ─────────────────────────────────────────────────────
+      # Step 1: CRITICAL gate — pipeline fails if any CRITICAL CVE is found.
+      # The .trivyignore file at the repo root allows accepted/known CVEs.
+      - name: Trivy scan — CRITICAL (gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.SOURCE_IMAGE }}
+          format: table
+          output: trivy-critical-${{ inputs.service }}.txt
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL
+          trivyignores: .trivyignore
+
+      # Step 2: HIGH scan — informational only, does not block the push.
+      - name: Trivy scan — HIGH (informational)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.SOURCE_IMAGE }}
+          format: table
+          output: trivy-high-${{ inputs.service }}.txt
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: HIGH
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results-${{ inputs.service }}-${{ inputs.sha }}
+          path: |
+            trivy-critical-${{ inputs.service }}.txt
+            trivy-high-${{ inputs.service }}.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ── Tag and push ───────────────────────────────────────────────────────
+      # Trivy gate passed — tag the Maven-built image with the commit SHA and
+      # push to the dev ECR repository.
+      - name: Tag image with commit SHA
+        run: |
+          docker tag "${{ env.SOURCE_IMAGE }}" "${{ env.TARGET_IMAGE }}"
+          echo "Tagged: ${{ env.SOURCE_IMAGE }} → ${{ env.TARGET_IMAGE }}"
+
+      - name: Push image to ECR
+        run: |
+          docker push "${{ env.TARGET_IMAGE }}"
+          echo "Pushed: ${{ env.TARGET_IMAGE }}"
+
+      - name: Logout from ECR
+        if: always()
+        run: |
+          docker logout \
+            "${{ inputs.aws-account-id }}.dkr.ecr.${{ inputs.aws-region }}.amazonaws.com"

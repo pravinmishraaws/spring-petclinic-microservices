@@ -1,0 +1,23 @@
+# .trivyignore — Trivy CVE allowlist for Spring Petclinic Microservices
+#
+# Add CVE IDs here (one per line) to suppress known/accepted vulnerabilities
+# from failing the CI pipeline. Entries apply to BOTH CRITICAL and HIGH scans.
+#
+# Format:
+#   CVE-YYYY-NNNNN              # suppress globally
+#   CVE-YYYY-NNNNN pkg:version  # suppress for a specific package version (if supported)
+#
+# Before adding an entry, document:
+#   - WHY it is accepted (no fix available, low exploitability, internal-only)
+#   - WHEN to re-evaluate (e.g. when a fix is released upstream)
+#   - JIRA ticket reference (PETPLAT-xxx)
+#
+# Example:
+#   # CVE-2023-XXXXX: Unfixed in eclipse-temurin:17 base image as of 2026-04.
+#   # Re-evaluate when eclipse-temurin:17 releases a patched layer.
+#   # Ref: PETPLAT-999
+#   CVE-2023-XXXXX
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Currently no accepted CVEs. Add entries below this line only after review.
+# ─────────────────────────────────────────────────────────────────────────────

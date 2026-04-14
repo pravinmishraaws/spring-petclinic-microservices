@@ -1,0 +1,159 @@
+# build-push.yml
+#
+# CI pipeline for Spring Petclinic Microservices.
+# Triggered on push to main. Detects which of the 8 service directories changed,
+# builds ARM64 Docker images for changed services only, scans with Trivy,
+# pushes to ECR (dev), then dispatches an event to the platform repo so
+# update-image-tags.yml can commit the new tag to helm-values/.
+#
+# Prerequisites — GitHub repository SECRETS:
+#   AWS_ROLE_ARN        — OIDC IAM role ARN (output of petclinic github-oidc module)
+#   AWS_ACCOUNT_ID      — AWS account ID (used to construct ECR registry URL)
+#   PLATFORM_REPO_TOKEN — GitHub PAT with contents:write + metadata:read on the
+#                         platform repo. Create at Settings → Developer settings →
+#                         PATs → Fine-grained, scoped to pravinmishraaws/petclinic-platform.
+#
+# Prerequisites — GitHub repository VARIABLES:
+#   AWS_REGION    — AWS region (eu-central-1)
+#   PLATFORM_REPO — Platform repository path (pravinmishraaws/petclinic-platform)
+#
+# Reusable workflow:
+#   .github/workflows/reusable/ecr-login.yml handles the per-service build,
+#   Trivy scan, and ECR push. This file orchestrates change detection and
+#   the post-push dispatch only.
+
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write  # Required for OIDC token exchange in the reusable workflow
+  contents: read
+
+jobs:
+  # ── Job 1: Detect which services changed ────────────────────────────────────
+  # Uses dorny/paths-filter to map service directories to boolean outputs, then
+  # builds a JSON array of changed service names for the build matrix.
+  detect-changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:      ${{ steps.build-matrix.outputs.matrix }}
+      has-changes: ${{ steps.build-matrix.outputs.has-changes }}
+      services:    ${{ steps.build-matrix.outputs.services }}
+      sha:         ${{ steps.build-matrix.outputs.sha }}
+
+    steps:
+      # TODO(security): pin each action to a full commit SHA to prevent supply-chain
+      # attacks. Replace "@vN" with "@<sha>  # vN.N.N" once SHAs are verified.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect changed service directories
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            config-server:
+              - 'spring-petclinic-config-server/**'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+
+      - name: Build service matrix
+        id: build-matrix
+        run: |
+          # Collect names of services whose directories changed.
+          services=()
+          [ "${{ steps.filter.outputs.config-server }}"     = "true" ] && services+=("config-server")
+          [ "${{ steps.filter.outputs.discovery-server }}"  = "true" ] && services+=("discovery-server")
+          [ "${{ steps.filter.outputs.api-gateway }}"       = "true" ] && services+=("api-gateway")
+          [ "${{ steps.filter.outputs.customers-service }}" = "true" ] && services+=("customers-service")
+          [ "${{ steps.filter.outputs.visits-service }}"    = "true" ] && services+=("visits-service")
+          [ "${{ steps.filter.outputs.vets-service }}"      = "true" ] && services+=("vets-service")
+          [ "${{ steps.filter.outputs.genai-service }}"     = "true" ] && services+=("genai-service")
+          [ "${{ steps.filter.outputs.admin-server }}"      = "true" ] && services+=("admin-server")
+
+          # Compute the 7-character SHA once; reused by all build jobs and the dispatch payload.
+          SHA="${GITHUB_SHA::7}"
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+
+          if [ ${#services[@]} -eq 0 ]; then
+            echo "No service directories changed — skipping build."
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "matrix=[]"        >> $GITHUB_OUTPUT
+            echo "services="        >> $GITHUB_OUTPUT
+          else
+            # Build a JSON array: ["customers-service","vets-service"]
+            MATRIX=$(printf '"%s"\n' "${services[@]}" | jq -sc .)
+            echo "matrix=${MATRIX}"          >> $GITHUB_OUTPUT
+            echo "has-changes=true"          >> $GITHUB_OUTPUT
+            echo "services=${services[*]}"   >> $GITHUB_OUTPUT
+            echo "Changed services (${#services[@]}): ${services[*]}"
+          fi
+
+  # ── Job 2: Build, scan, push (one job per changed service) ──────────────────
+  # Each matrix entry calls the reusable ecr-login workflow which handles:
+  #   checkout → JDK → QEMU → Buildx → OIDC auth → ECR login →
+  #   Maven build → Trivy CRITICAL gate → Trivy HIGH info → tag → push
+  #
+  # fail-fast: false — a failure in one service does not cancel others.
+  build:
+    name: Build ${{ matrix.service }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    strategy:
+      matrix:
+        service: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+    uses: ./.github/workflows/reusable/ecr-login.yml
+    with:
+      service:        ${{ matrix.service }}
+      sha:            ${{ needs.detect-changes.outputs.sha }}
+      aws-region:     ${{ vars.AWS_REGION || 'eu-central-1' }}
+      aws-account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+    secrets: inherit
+
+  # ── Job 3: Notify platform repo ─────────────────────────────────────────────
+  # Fires a repository_dispatch to pravinmishraaws/petclinic-platform once all
+  # build jobs succeed. The platform repo's update-image-tags.yml picks this up
+  # and commits the new image tag to helm-values/{service}.yaml for ArgoCD.
+  #
+  # Payload:
+  #   sha      — 7-character commit SHA (matches the ECR image tag)
+  #   services — space-separated list of services that were built
+  #              (update-image-tags.yml iterates over these; not all 8)
+  notify:
+    name: Notify platform repo
+    needs: [detect-changes, build]
+    # Run only when all build jobs succeeded; skip if none were built.
+    if: |
+      always() &&
+      needs.detect-changes.outputs.has-changes == 'true' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch app-image-built to platform repo
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          repository: ${{ vars.PLATFORM_REPO }}
+          event-type: app-image-built
+          client-payload: |
+            {
+              "sha": "${{ needs.detect-changes.outputs.sha }}",
+              "services": "${{ needs.detect-changes.outputs.services }}"
+            }
