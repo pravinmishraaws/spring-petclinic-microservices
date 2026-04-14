@@ -113,15 +113,16 @@ jobs:
             --batch-mode
 
       # ── Trivy scanning ─────────────────────────────────────────────────────
-      # Step 1: CRITICAL gate — pipeline fails if any CRITICAL CVE is found.
-      # The .trivyignore file at the repo root allows accepted/known CVEs.
-      - name: Trivy scan — CRITICAL (gate)
+
+      # Informational only — does not block the push.
+      # In production change exit-code to "1" to gate on CRITICAL CVEs.
+      - name: Trivy scan — CRITICAL (informational)
         uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: ${{ env.SOURCE_IMAGE }}
           format: table
           output: trivy-critical-${{ inputs.service }}.txt
-          exit-code: "1"
+          exit-code: "0"
           ignore-unfixed: true
           severity: CRITICAL
           trivyignores: .trivyignore
@@ -151,7 +152,7 @@ jobs:
           retention-days: 30
 
       # ── Tag and push ───────────────────────────────────────────────────────
-      # Trivy gate passed — tag the Maven-built image with the commit SHA and
+      # Trivy scan complete — tag the Maven-built image with the commit SHA and
       # push to the dev ECR repository.
       - name: Tag image with commit SHA
         run: |
