@@ -116,7 +116,7 @@ jobs:
       # Step 1: CRITICAL gate — pipeline fails if any CRITICAL CVE is found.
       # The .trivyignore file at the repo root allows accepted/known CVEs.
       - name: Trivy scan — CRITICAL (gate)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: ${{ env.SOURCE_IMAGE }}
           format: table
@@ -129,7 +129,7 @@ jobs:
       # Step 2: HIGH scan — informational only, does not block the push.
       - name: Trivy scan — HIGH (informational)
         if: always()
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: ${{ env.SOURCE_IMAGE }}
           format: table
