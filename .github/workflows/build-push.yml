@@ -8,14 +8,14 @@
 #
 # Prerequisites — GitHub repository SECRETS:
 #   AWS_ROLE_ARN        — OIDC IAM role ARN (output of petclinic github-oidc module)
-#   AWS_ACCOUNT_ID      — AWS account ID (used to construct ECR registry URL)
 #   PLATFORM_REPO_TOKEN — GitHub PAT with contents:write + metadata:read on the
 #                         platform repo. Create at Settings → Developer settings →
 #                         PATs → Fine-grained, scoped to pravinmishraaws/petclinic-platform.
 #
 # Prerequisites — GitHub repository VARIABLES:
-#   AWS_REGION    — AWS region (eu-central-1)
-#   PLATFORM_REPO — Platform repository path (pravinmishraaws/petclinic-platform)
+#   AWS_REGION      — AWS region (eu-central-1)
+#   AWS_ACCOUNT_ID  — AWS account ID (used to construct ECR registry URL)
+#   PLATFORM_REPO   — Platform repository path (pravinmishraaws/petclinic-platform)
 #
 # Reusable workflow:
 #   .github/workflows/reusable/ecr-login.yml handles the per-service build,
@@ -124,7 +124,7 @@ jobs:
       service:        ${{ matrix.service }}
       sha:            ${{ needs.detect-changes.outputs.sha }}
       aws-region:     ${{ vars.AWS_REGION || 'eu-central-1' }}
-      aws-account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+      aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
     secrets: inherit
 
   # ── Job 3: Notify platform repo ─────────────────────────────────────────────
