@@ -18,7 +18,7 @@
 #   PLATFORM_REPO   — Platform repository path (pravinmishraaws/petclinic-platform)
 #
 # Reusable workflow:
-#   .github/workflows/reusable/ecr-login.yml handles the per-service build,
+#   .github/workflows/ecr-build-push.yml handles the per-service build,
 #   Trivy scan, and ECR push. This file orchestrates change detection and
 #   the post-push dispatch only.
 
@@ -119,7 +119,7 @@ jobs:
       matrix:
         service: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
       fail-fast: false
-    uses: ./.github/workflows/reusable/ecr-login.yml
+    uses: ./.github/workflows/ecr-build-push.yml
     with:
       service:        ${{ matrix.service }}
       sha:            ${{ needs.detect-changes.outputs.sha }}
